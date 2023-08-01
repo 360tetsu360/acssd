@@ -1,6 +1,9 @@
+use chrono::{DateTime, Local};
 use opencv::{prelude::*, Error};
+use std::path::PathBuf;
+use tokio::sync::mpsc::Sender;
 opencv::opencv_branch_4! {
-    use opencv::{core::*, imgproc, videoio::{VideoCapture, CAP_ANY}};
+    use opencv::{core::*, imgproc, videoio::{VideoCapture, CAP_ANY}, imgcodecs};
 }
 
 const FPS: u32 = 15;
@@ -69,10 +72,11 @@ pub struct Detector {
     cap: VideoCapture,
     exposure: f32,
     mask: Option<Mat>,
+    out_dir: PathBuf,
 }
 
 impl Detector {
-    pub fn new(url: &str, use_mask: bool) -> Result<Self, Error> {
+    pub fn new(url: &str, use_mask: bool, out_dir: PathBuf) -> Result<Self, Error> {
         let cap = VideoCapture::from_file(url, CAP_ANY).unwrap();
 
         if !cap.is_opened().unwrap() {
@@ -99,11 +103,12 @@ impl Detector {
             cap,
             exposure: 1.,
             mask,
+            out_dir,
         })
     }
 
     // 露出時間を処理
-    pub fn detect(&mut self) -> Result<bool, Error> {
+    pub fn detect(&mut self) -> Result<Option<DetectedMeteor>, Error> {
         let mut imgs = vec![];
 
         let frame_range = (self.exposure * FPS as f32) as usize;
@@ -111,14 +116,22 @@ impl Detector {
             let mut frame = Mat::default();
             let has_next = self.cap.read(&mut frame)?;
 
-            if !has_next {}
+            if !has_next {
+                return Err(Error::new(-1000, "RTSP end"));
+            }
+            if frame.empty() {
+                log::warn!("RTSP received nothing");
+                continue;
+            }
 
             let mut gray_frame = Mat::default();
             imgproc::cvt_color(&frame, &mut gray_frame, imgproc::COLOR_BGR2GRAY, 0)?;
             imgs.push(gray_frame);
         }
 
-        if imgs.len() < 3 {}
+        if imgs.len() < 3 {
+            return Ok(None);
+        }
 
         let diff_list = make_diff_list(&imgs, &self.mask)?;
 
@@ -126,6 +139,51 @@ impl Detector {
 
         let detected = detect_lines(&brightest, 10.)?;
 
-        Ok(!detected.is_empty())
+        if detected.is_empty() {
+            return Ok(None);
+        }
+
+        let time = chrono::offset::Local::now();
+        let file_name = time.format("%Y%m%d%H%S").to_string() + ".jpg";
+
+        let path = self.out_dir.join(file_name);
+
+        let path_str = path.as_os_str().to_str().unwrap();
+        imgcodecs::imwrite(path_str, &brightest, &Vector::default())?;
+
+        Ok(Some(DetectedMeteor {
+            time,
+            img_path: path,
+        }))
+    }
+}
+
+pub struct DetectedMeteor {
+    pub time: DateTime<Local>,
+    pub img_path: PathBuf,
+}
+
+pub enum DetectionStatusMsg {
+    Detected(DetectedMeteor),
+    Error(Error),
+}
+
+pub fn detection_loop(mut detector: Detector, sender: Sender<DetectionStatusMsg>) {
+    loop {
+        let res = match detector.detect() {
+            Ok(res) => res,
+            Err(e) => {
+                let sender_cp = sender.clone();
+                futures::executor::block_on(sender_cp.send(DetectionStatusMsg::Error(e))).unwrap();
+                continue;
+            }
+        };
+
+        if let Some(detection) = res {
+            let sender_cp = sender.clone();
+
+            futures::executor::block_on(sender_cp.send(DetectionStatusMsg::Detected(detection)))
+                .unwrap();
+        }
     }
 }
